@@ -202,6 +202,11 @@ Restrictions
 - Dynamic mode is supported for object backends ("OBJ", "AZURE_BLOB", "DOCA_MEMOS") and file backends ("POSIX", "GDS", "GDS_MT", "HF3FS").
 - save_unfull_chunk must be set to False.
 
+Path-mode file registration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For file backends ("POSIX", "GDS", "GDS_MT", "HF3FS"), the dynamic backend registers files with NIXL `path-mode <https://github.com/ai-dynamo/nixl/blob/main/src/utils/file/README.md>`_: instead of opening one fd per key in Python, each descriptor carries ``<modes>:<path>`` (e.g. ``rw,create:/mnt/nixl/cache/<key>`` for writes, ``ro:/mnt/nixl/cache/<key>`` for reads) and the NIXL plugin opens the file in ``register_memory`` and closes it in ``deregister_memory``. This requires a NIXL build with path-mode support (NIXL >= 1.3.0). ``use_direct_io: true`` is passed through as the ``direct`` mode flag (``O_DIRECT``).
+
 Example ``lmcache-config.yaml`` for OBJ backend with dynamic mode:
 
 .. code-block:: yaml

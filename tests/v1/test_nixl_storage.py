@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 
 # Third Party
@@ -465,6 +466,139 @@ def test_nixl_posix_backend(nixl_tmp_path):
     config.extra_config["nixl_path"] = nixl_tmp_path
 
     run(config, shape, dtype)
+
+
+def _count_files(path: str) -> int:
+    """Number of regular files directly under ``path``."""
+    return sum(os.path.isfile(os.path.join(path, f)) for f in os.listdir(path))
+
+
+def run_dynamic(config: LMCacheEngineConfig, shape, dtype, nixl_tmp_path: str):
+    """Put/get/remove roundtrip for the dynamic (nixl_pool_size=0) backend.
+
+    For FILE backends the dynamic backend registers files with NIXL
+    path-mode (``<modes>:<path>`` in metaInfo) instead of pre-opening fds,
+    so this also asserts the observable on-disk effects of each operation.
+    """
+    keys = []
+    objs = []
+    keys.append(
+        create_key("e3229141e680fb413d2c5d3ebb416c4ad300d381e309fc9e417757b91406c157")
+    )
+    keys.append(
+        create_key("e3229141e680fb413d2c5d3ebb416c4ad300d381e309fc9e417757b91406d268")
+    )
+    bad_key = create_key("deadbeefdeadbeef")
+
+    thread_loop = None
+    thread = None
+    try:
+        thread_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=thread_loop.run_forever)
+        thread.start()
+
+        metadata = LMCacheMetadata(
+            model_name="Llama-3.1-70B-Instruct",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=dtype,
+            kv_shape=shape,
+        )
+
+        backends = CreateStorageBackends(
+            config,
+            metadata,
+            thread_loop,
+            dst_device=get_correct_device(
+                config.nixl_buffer_device, metadata.worker_id
+            ),
+        )
+        nixl_backend = backends["NixlStorageBackend"]
+        assert isinstance(nixl_backend, NixlStorageBackend)
+
+        alloc_shape = metadata.get_shapes()[0]
+        for key in keys:
+            assert not nixl_backend.contains(key, False)
+            obj = nixl_backend.memory_allocator.allocate(alloc_shape, dtype)
+            assert obj is not None
+            assert obj.tensor is not None
+            objs.append(obj)
+
+        objs[0].tensor[0, 0, 100, 200] = 1e-3
+        objs[1].tensor[0, 1, 150, 400] = 1e-2
+
+        nixl_backend.batched_submit_put_task(keys, objs)
+
+        # Wait until every put has fully completed (immediate in sync mode).
+        deadline = time.time() + 30
+        while any(nixl_backend.exists_in_put_tasks(key) for key in keys):
+            assert time.time() < deadline, "timed out waiting for async put"
+            time.sleep(0.05)
+
+        # Path-mode registration created one file per key under nixl_path.
+        assert _count_files(nixl_tmp_path) == len(keys)
+
+        for key, obj in zip(keys, objs, strict=False):
+            assert nixl_backend.contains(key, False)
+            returned_memory_obj = nixl_backend.get_blocking(key)
+            assert returned_memory_obj is not None
+            assert returned_memory_obj.tensor is not None
+            assert torch.equal(returned_memory_obj.tensor, obj.tensor)
+
+        # Reading a key whose file does not exist is a miss, and the
+        # read-only (``ro:``) path-mode registration must not create a file.
+        assert nixl_backend.get_blocking(bad_key) is None
+        assert _count_files(nixl_tmp_path) == len(keys)
+
+        # remove() unlinks the stored file.
+        assert nixl_backend.remove(keys[0])
+        assert _count_files(nixl_tmp_path) == len(keys) - 1
+        assert not nixl_backend.contains(keys[0], False)
+
+        for backend in backends.values():
+            backend.close()
+
+    except Exception:
+        raise
+    finally:
+        if thread_loop and thread_loop.is_running():
+            thread_loop.call_soon_threadsafe(thread_loop.stop)
+        if thread and thread.is_alive():
+            thread.join()
+
+
+def _make_dynamic_posix_config(nixl_tmp_path: str) -> LMCacheEngineConfig:
+    BASE_DIR = Path(__file__).parent
+    config = LMCacheEngineConfig.from_file(BASE_DIR / "data/nixl.yaml")
+    config.extra_config["nixl_backend"] = "POSIX"
+    config.extra_config["nixl_pool_size"] = 0  # dynamic storage
+    config.extra_config["nixl_path"] = nixl_tmp_path
+    return config
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.skipif(
+    not _can_register_file_with_nixl_backend("POSIX"),
+    reason="NIXL POSIX backend cannot register file handles in this environment",
+)
+def test_nixl_posix_dynamic_backend_path_mode(nixl_tmp_path):
+    """Dynamic POSIX backend stores/reads files via path-mode registration."""
+    config = _make_dynamic_posix_config(nixl_tmp_path)
+    run_dynamic(config, torch.Size([4, 2, 256, 8, 128]), torch.bfloat16, nixl_tmp_path)
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.skipif(
+    not _can_register_file_with_nixl_backend("POSIX"),
+    reason="NIXL POSIX backend cannot register file handles in this environment",
+)
+def test_nixl_posix_dynamic_backend_path_mode_async_put(nixl_tmp_path):
+    """Same path-mode roundtrip with nixl_async_put (background cleanup)."""
+    config = _make_dynamic_posix_config(nixl_tmp_path)
+    config.extra_config["nixl_async_put"] = True
+    run_dynamic(config, torch.Size([4, 2, 256, 8, 128]), torch.bfloat16, nixl_tmp_path)
 
 
 @pytest.mark.no_shared_allocator

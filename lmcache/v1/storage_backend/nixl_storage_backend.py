@@ -90,10 +90,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# POSIX permission mode for files created via ``os.open()`` with ``O_CREAT``.
-# 0o644 = rw-r--r-- (owner read/write, group/others read-only).
-DEFAULT_FILE_CREATE_MODE = 0o644
-
 # Max concurrency for parallel S3 HEAD requests in batched_contains().
 _CONTAINS_BATCH_SIZE = 16
 
@@ -384,18 +380,34 @@ PresenceCache = Union[SetPresenceCache]
 
 @dataclass
 class NixlDesc:
+    # For FILE backends, device_id is only a registration key inside NIXL
+    # (path-mode registration, see _format_path_mode_meta) -- it is NOT an
+    # fd owned by this process, so it must never be passed to os.close().
     device_id: int
     meta_info: str
     path: Optional[str] = None
 
 
-def _close_file_descs(descs: List[NixlDesc]) -> None:
-    """Best-effort close of the FDs in descs."""
-    for d in descs:
-        try:
-            os.close(d.device_id)
-        except OSError:
-            pass
+def _format_path_mode_meta(path: str, write: bool, use_direct_io: bool) -> str:
+    """Build a NIXL path-mode ``metaInfo`` string for a FILE descriptor.
+
+    Path-mode registration declares a file by path instead of by a
+    pre-opened fd; the NIXL file backend opens the file in
+    ``register_memory`` and closes it in ``deregister_memory``. This
+    collapses one Python ``os.open()`` per key into the batched
+    registration call. See the NIXL file-utils README
+    (``src/utils/file/README.md``) for the ``<modes>:<path>`` grammar.
+
+    :param path: File path to register.
+    :param write: If True, open read-write and create the file if missing
+        (``rw,create``, mode 0644); otherwise open read-only (``ro``).
+    :param use_direct_io: Append the ``direct`` flag (``O_DIRECT``).
+    :return: The ``metaInfo`` string, e.g. ``rw,create,direct:/cache/x.bin``.
+    """
+    modes = ["rw", "create"] if write else ["ro"]
+    if use_direct_io:
+        modes.append("direct")
+    return ",".join(modes) + ":" + path
 
 
 def _unlink_file_descs(descs: List[NixlDesc]) -> None:
@@ -403,7 +415,8 @@ def _unlink_file_descs(descs: List[NixlDesc]) -> None:
     Best-effort unlink of every desc whose ``path`` is set.
 
     Called only on FILE-write failure paths to remove the (empty or
-    partially-written) file we created with ``O_CREAT``.
+    partially-written) file created via the path-mode ``create`` flag, so
+    that ``contains()`` does not observe it as a bogus hit.
     """
     for d in descs:
         if d.path is None:
@@ -672,19 +685,18 @@ class NixlDynamicStorageAgent(NixlStorageAgent):
         self,
         reg_descs: nixlBind.nixlRegDList,
         xfer_handler: NixlDlistHandle,
-        descs: List[NixlDesc],
     ) -> None:
         """
         Release storage handler resources.
 
+        For FILE backends, ``deregister_memory`` also closes the files that
+        path-mode registration opened in ``register_memory``.
+
         :param reg_descs: Memory descriptors to deregister.
         :param xfer_handler: Transfer dlist handle to release.
-        :param descs: Descriptors used for this transfer.
         """
         self.nixl_agent.release_dlist_handle(xfer_handler)
         self.nixl_agent.deregister_memory(reg_descs)
-        if self.mem_type == "FILE":
-            _close_file_descs(descs)
 
     def nixl_desc_exists(self, meta_info: str, path: str) -> bool:
         """
@@ -1412,15 +1424,13 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 "static pools."
             )
         self.path: str = nixl_config.path
-        self.direct_io_flag = 0
-        if nixl_config.use_direct_io:
-            if hasattr(os, "O_DIRECT"):
-                self.direct_io_flag = os.O_DIRECT
-            else:
-                logger.warning(
-                    "use_direct_io is True, but O_DIRECT is not available on "
-                    "this system. Falling back to buffered I/O."
-                )
+        self.use_direct_io = nixl_config.use_direct_io
+        if self.use_direct_io and not hasattr(os, "O_DIRECT"):
+            logger.warning(
+                "use_direct_io is True, but O_DIRECT is not available on "
+                "this system. Falling back to buffered I/O."
+            )
+            self.use_direct_io = False
         # DOCA_MEMOS needs object names that fit into 128 bits; other OBJ
         # backends use URL-safe names. See _format_object_key.
         self._use_b128_object_keys = nixl_config.backend == "DOCA_MEMOS"
@@ -1559,13 +1569,20 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         self, keys: Sequence[CacheEngineKey], *, write: bool
     ) -> List[NixlDesc]:
         """
-        Build NixlDescs for ``keys``. For FILE backends this opens one fd per
-        key; the caller owns FD lifetime once this method returns successfully.
-        On mid-loop failure, every already-opened fd is closed before the exception
-        is re-raised (for write paths, files are also unlinked).
+        Build NixlDescs for ``keys``.
 
-        :param write: If True, opens with O_CREAT | O_RDWR (mem_to_storage).
-            If False, opens with O_RDONLY (storage_to_mem).
+        For FILE backends this uses NIXL path-mode registration: each
+        descriptor carries ``<modes>:<path>`` in ``meta_info`` and the NIXL
+        file backend opens the file in ``register_memory`` and closes it in
+        ``deregister_memory`` (see NIXL ``src/utils/file/README.md``), instead
+        of paying one Python ``os.open()`` per key here. ``device_id`` is only
+        a registration key inside NIXL, so unique IDs are allocated per batch
+        (the backend requires a unique devId per concurrently registered
+        file), using the same scheme as OBJ.
+
+        :param write: If True, registers ``rw,create`` (mem_to_storage) and
+            records the path on the desc for failure-path unlink. If False,
+            registers ``ro`` (storage_to_mem).
         """
         if self.agent.mem_type == "OBJ":
             device_ids = self._alloc_device_ids(len(keys))
@@ -1574,26 +1591,20 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 for i, k in enumerate(keys)
             ]
         if self.agent.mem_type == "FILE":
-            flags = (os.O_CREAT | os.O_RDWR) if write else os.O_RDONLY
-            flags |= self.direct_io_flag
-            mode_args = (DEFAULT_FILE_CREATE_MODE,) if write else ()
+            device_ids = self._alloc_device_ids(len(keys))
             descs: List[NixlDesc] = []
-            try:
-                for k in keys:
-                    path = os.path.join(self.path, self._format_object_key(k))
-                    fd = os.open(path, flags, *mode_args)
-                    descs.append(
-                        NixlDesc(
-                            device_id=fd,
-                            meta_info="",
-                            path=path if write else None,
-                        )
+            for i, k in enumerate(keys):
+                path = os.path.join(self.path, self._format_object_key(k))
+                descs.append(
+                    NixlDesc(
+                        device_id=device_ids[i],
+                        meta_info=_format_path_mode_meta(
+                            path, write=write, use_direct_io=self.use_direct_io
+                        ),
+                        path=path if write else None,
                     )
-                return descs
-            except OSError:
-                _close_file_descs(descs)
-                _unlink_file_descs(descs)
-                raise
+                )
+            return descs
         # Already validated in validate_nixl_backend
         raise ValueError(f"unexpected mem_type: {self.agent.mem_type}")
 
@@ -1610,12 +1621,12 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         NixlDlistHandle,
         NixlXferHandle,
     ]:
-        """Open FDs, register the storage handler, and build the transfer handle.
+        """Register the storage handler and build the transfer handle.
 
-        On any failure, releases everything already acquired (FDs, NIXL
-        state, and any FILE-write files created with ``O_CREAT``) before
-        re-raising, so the caller either gets a fully-acquired tuple or
-        an exception with nothing leaked.
+        On any failure, releases everything already acquired (NIXL state,
+        and any FILE-write files created via the path-mode ``create`` flag)
+        before re-raising, so the caller either gets a fully-acquired tuple
+        or an exception with nothing leaked.
         """
         descs = self._build_descs(keys, write=write)
         try:
@@ -1623,9 +1634,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 descs, page_size
             )
         except Exception:
-            if self.agent.mem_type == "FILE":
-                _close_file_descs(descs)
-                _unlink_file_descs(descs)
+            _unlink_file_descs(descs)
             raise
 
         try:
@@ -1638,10 +1647,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                     mem_indices, xfer_handler, storage_indices
                 )
         except Exception:
-            # release_storage_handler closes the FDs and releases the dlist.
-            self.agent.release_storage_handler(reg_descs, xfer_handler, descs)
-            if self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
+            self.agent.release_storage_handler(reg_descs, xfer_handler)
+            _unlink_file_descs(descs)
             raise
 
         return descs, reg_descs, xfer_handler, handle
@@ -1714,10 +1721,12 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             descs, reg_descs, xfer_handler, handle = self._acquire_storage_handle(
                 keys, mem_indices, storage_indices, page_size, write=False
             )
-        except FileNotFoundError:
-            # FILE backend: at least one key's file does not exist,
-            # treat the whole batch as a miss.
-            logger.warning("storage_to_mem: missing file in FILE backend")
+        except nixlBind.nixlBackendError:
+            if self.agent.mem_type != "FILE":
+                raise
+            # FILE backend: path-mode registration failed (e.g. at least one
+            # key's file does not exist); treat the whole batch as a miss.
+            logger.warning("storage_to_mem: path-mode registration failed")
             for obj in obj_list:
                 if obj is not None:
                     obj.ref_count_down()
@@ -1736,7 +1745,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 xfer_state = False
             finally:
                 self.agent.release_handle(handle)
-                self.agent.release_storage_handler(reg_descs, xfer_handler, descs)
+                self.agent.release_storage_handler(reg_descs, xfer_handler)
         except Exception:
             # Acquisition or transfer raised; return the allocated MemoryObj
             # slots to the allocator so they aren't leaked.
@@ -1790,9 +1799,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         finally:
             # Release the handle after transfer completes (success or failure)
             self.agent.release_handle(handle)
-            self.agent.release_storage_handler(
-                storage_reg_descs, storage_xfer_handler, descs
-            )
+            self.agent.release_storage_handler(storage_reg_descs, storage_xfer_handler)
 
             if state == "DONE":
                 for key in keys:
@@ -1858,9 +1865,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             )
         except Exception:
             self.agent.release_handle(handle)
-            self.agent.release_storage_handler(reg_descs, xfer_handler, descs)
-            if self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
+            self.agent.release_storage_handler(reg_descs, xfer_handler)
+            _unlink_file_descs(descs)
             raise
 
     def _run_sync_mem_to_storage(
@@ -1876,12 +1882,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         try:
             self.agent.post_blocking(handle)
         except Exception:
-            if self.agent.mem_type == "FILE":
-                _unlink_file_descs(descs)
+            _unlink_file_descs(descs)
             raise
         finally:
             self.agent.release_handle(handle)
-            self.agent.release_storage_handler(reg_descs, xfer_handler, descs)
+            self.agent.release_storage_handler(reg_descs, xfer_handler)
 
         duration = time.time() - start_time
         logger.debug(
